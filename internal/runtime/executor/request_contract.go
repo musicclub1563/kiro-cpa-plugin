@@ -7,6 +7,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	kirocommon "github.com/nguyenha935/kiro-cpa-plugin/internal/translator/kiro/common"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -99,7 +100,9 @@ func normalizeKiroTools(body []byte, source sdktranslator.Format) ([]byte, error
 	changed := false
 	for _, tool := range tools.Array() {
 		toolType := strings.TrimSpace(tool.Get("type").String())
-		supported := toolType == ""
+		// Anthropic client tools may omit type or spell it "custom"; any other
+		// type names a server tool.
+		supported := toolType == "" || toolType == "custom"
 		if openAIChat {
 			supported = toolType == "function"
 		}
@@ -167,14 +170,18 @@ func truncateUTF8(value string, maxBytes int) string {
 	return value
 }
 
+// normalizeClaudeSystemMessages turns inline system messages into user text at
+// their own position. Kiro has no system role, and its prompt cache matches the
+// request prefix: hoisting them into the system prompt, which leads the first
+// user turn, changed the oldest history entry whenever a client appended one
+// (Claude Code does so on every turn), so no turn reused the cache.
 func normalizeClaudeSystemMessages(body []byte) ([]byte, error) {
 	messages := gjson.GetBytes(body, "messages")
 	if !messages.Exists() || !messages.IsArray() {
 		return body, nil
 	}
 
-	systemParts, err := claudeSystemTextParts(gjson.GetBytes(body, "system"))
-	if err != nil {
+	if _, err := claudeSystemTextParts(gjson.GetBytes(body, "system")); err != nil {
 		return nil, err
 	}
 	kept := make([]string, 0, len(messages.Array()))
@@ -189,23 +196,33 @@ func normalizeClaudeSystemMessages(body []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		systemParts = append(systemParts, parts...)
+		if len(parts) == 0 {
+			continue
+		}
+		blocks := make([]map[string]string, 0, len(parts))
+		for _, part := range parts {
+			blocks = append(blocks, map[string]string{"type": "text", "text": part})
+		}
+		raw, err := json.Marshal(map[string]any{"role": "user", "content": blocks})
+		if err != nil {
+			return nil, fmt.Errorf("normalize Kiro system message: %w", err)
+		}
+		kept = append(kept, string(raw))
 	}
 	if !changed {
 		return body, nil
 	}
 
-	normalized, err := sjson.SetRawBytes(body, "messages", []byte("["+strings.Join(kept, ",")+"]"))
+	// Coalesce with neighbouring user turns, so a system message between a
+	// tool_use and its tool_result still leaves the result next to its call.
+	merged := kirocommon.MergeAdjacentMessages(gjson.Parse("[" + strings.Join(kept, ",") + "]").Array())
+	raws := make([]string, 0, len(merged))
+	for _, message := range merged {
+		raws = append(raws, message.Raw)
+	}
+	normalized, err := sjson.SetRawBytes(body, "messages", []byte("["+strings.Join(raws, ",")+"]"))
 	if err != nil {
 		return nil, fmt.Errorf("normalize Kiro conversation messages: %w", err)
-	}
-	if len(systemParts) == 0 {
-		normalized, err = sjson.DeleteBytes(normalized, "system")
-	} else {
-		normalized, err = sjson.SetBytes(normalized, "system", strings.Join(systemParts, "\n\n"))
-	}
-	if err != nil {
-		return nil, fmt.Errorf("normalize Kiro system prompt: %w", err)
 	}
 	return normalized, nil
 }
@@ -215,10 +232,10 @@ func claudeSystemTextParts(content gjson.Result) ([]string, error) {
 		return nil, nil
 	}
 	if content.Type == gjson.String {
-		if content.String() == "" {
+		if kirocommon.StripClaudeBillingHeader(content.String()) == "" {
 			return nil, nil
 		}
-		return []string{content.String()}, nil
+		return []string{kirocommon.StripClaudeBillingHeader(content.String())}, nil
 	}
 	if !content.IsArray() {
 		return nil, fmt.Errorf("Kiro supports only text in Anthropic system messages")
@@ -226,16 +243,16 @@ func claudeSystemTextParts(content gjson.Result) ([]string, error) {
 	parts := make([]string, 0, len(content.Array()))
 	for _, block := range content.Array() {
 		if block.Type == gjson.String {
-			if block.String() != "" {
-				parts = append(parts, block.String())
+			if kirocommon.StripClaudeBillingHeader(block.String()) != "" {
+				parts = append(parts, kirocommon.StripClaudeBillingHeader(block.String()))
 			}
 			continue
 		}
 		if block.Get("type").String() != "text" {
 			return nil, fmt.Errorf("Kiro supports only text in Anthropic system messages")
 		}
-		if block.Get("text").String() != "" {
-			parts = append(parts, block.Get("text").String())
+		if kirocommon.StripClaudeBillingHeader(block.Get("text").String()) != "" {
+			parts = append(parts, kirocommon.StripClaudeBillingHeader(block.Get("text").String()))
 		}
 	}
 	return parts, nil
@@ -361,6 +378,16 @@ func validateClaudeConversation(body []byte, source string) error {
 			if _, expected := pendingToolUses[id]; !expected {
 				return requestValidationErr{msg: fmt.Sprintf("Anthropic tool_result %q does not match a preceding tool_use", id)}
 			}
+			// Images inside a tool result are forwarded on the user message, so
+			// they meet the same contract as top-level image blocks.
+			for _, item := range block.Get("content").Array() {
+				if item.Get("type").String() != "image" {
+					continue
+				}
+				if err := validateKiroImageBlock(item); err != nil {
+					return requestValidationErr{msg: err.Error()}
+				}
+			}
 			resolved[id] = struct{}{}
 			delete(pendingToolUses, id)
 		}
@@ -374,14 +401,15 @@ func validateClaudeConversation(body []byte, source string) error {
 func validateOpenAIConversation(body []byte) error {
 	messages := gjson.GetBytes(body, "messages").Array()
 	firstRole := ""
+	foundFirst := false
 	for _, message := range messages {
 		if err := validateKiroContentBlocks(message.Get("content"), sdktranslator.FormatOpenAI.String()); err != nil {
 			return requestValidationErr{msg: err.Error()}
 		}
 		role := message.Get("role").String()
-		if role != "system" && role != "developer" {
+		if !foundFirst && role != "system" && role != "developer" {
 			firstRole = role
-			break
+			foundFirst = true
 		}
 	}
 	if firstRole == "" {
@@ -444,17 +472,8 @@ func validateKiroContentBlocks(content gjson.Result, source string) error {
 		case "document":
 			return fmt.Errorf("Kiro does not support document content blocks")
 		case "image":
-			mediaType := strings.ToLower(strings.TrimSpace(block.Get("source.media_type").String()))
-			data := strings.TrimSpace(block.Get("source.data").String())
-			if mediaType == "" || data == "" {
-				return fmt.Errorf("Kiro image blocks require media_type and base64 data")
-			}
-			if !strings.HasPrefix(mediaType, "image/") {
-				return fmt.Errorf("Kiro supports only image MIME types")
-			}
-			decoded, err := base64.StdEncoding.DecodeString(data)
-			if err != nil || len(decoded) == 0 || len(decoded) > maxKiroImageBytes {
-				return fmt.Errorf("Kiro image data must be valid base64 and no larger than 10 MiB")
+			if err := validateKiroImageBlock(block); err != nil {
+				return err
 			}
 		case "image_url", "input_image":
 			value := block.Get("image_url.url").String()
@@ -473,6 +492,22 @@ func validateKiroContentBlocks(content gjson.Result, source string) error {
 				return fmt.Errorf("Kiro image data must be valid base64 and no larger than 10 MiB")
 			}
 		}
+	}
+	return nil
+}
+
+func validateKiroImageBlock(block gjson.Result) error {
+	mediaType := strings.ToLower(strings.TrimSpace(block.Get("source.media_type").String()))
+	data := strings.TrimSpace(block.Get("source.data").String())
+	if mediaType == "" || data == "" {
+		return fmt.Errorf("Kiro image blocks require media_type and base64 data")
+	}
+	if !strings.HasPrefix(mediaType, "image/") {
+		return fmt.Errorf("Kiro supports only image MIME types")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(data)
+	if err != nil || len(decoded) == 0 || len(decoded) > maxKiroImageBytes {
+		return fmt.Errorf("Kiro image data must be valid base64 and no larger than 10 MiB")
 	}
 	return nil
 }

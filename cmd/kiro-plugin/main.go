@@ -492,6 +492,7 @@ func handleLoginStart(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	noteHostConfig(req.Host)
 	stateBytes := make([]byte, 24)
 	if _, err := rand.Read(stateBytes); err != nil {
 		return nil, err
@@ -510,6 +511,7 @@ func handleLoginPoll(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	noteHostConfig(req.Host)
 	loginFlowsMu.Lock()
 	flow, found := loginFlows[req.State]
 	if !found {
@@ -538,7 +540,7 @@ func handleLoginPoll(raw []byte) ([]byte, error) {
 	flow.Polling = true
 	loginFlows[req.State] = flow
 	loginFlowsMu.Unlock()
-	created, err := kiroauth.NewSSOOIDCClient(pluginConfig).CreateTokenWithRegion(context.Background(), flow.ClientID, flow.ClientSecret, flow.DeviceCode, flow.Region)
+	created, err := credentialOIDCClient("").CreateTokenWithRegion(context.Background(), flow.ClientID, flow.ClientSecret, flow.DeviceCode, flow.Region)
 	if errors.Is(err, kiroauth.ErrAuthorizationPending) || errors.Is(err, kiroauth.ErrSlowDown) {
 		_ = updateLoginFlow(req.State, func(flow *loginFlow) { flow.Polling = false })
 		return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending, Message: "Waiting for AWS IAM Identity Center authorization"})
@@ -591,6 +593,7 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	noteHostConfig(req.Host)
 	if req.Provider != "" && !isKiroProviderLabel(req.Provider) {
 		return okEnvelope(pluginapi.AuthParseResponse{Handled: false})
 	}
@@ -829,6 +832,7 @@ func authData(token *kiroauth.KiroTokenData, fileName string) pluginapi.AuthData
 		ID:               fileName,
 		FileName:         fileName,
 		Label:            label,
+		ProxyURL:         strings.TrimSpace(token.ProxyURL),
 		StorageJSON:      storage,
 		Metadata:         authMetadata(token),
 		Attributes:       authAttributes(token),
@@ -1196,6 +1200,7 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	noteHostConfig(req.Host)
 	token, err := decodeToken(req.StorageJSON)
 	if err != nil {
 		return nil, err
@@ -1219,6 +1224,7 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	noteHostConfig(req.Host)
 	token, err := decodeToken(req.StorageJSON)
 	if err != nil {
 		return nil, err
@@ -1476,7 +1482,7 @@ func listAvailableModels(ctx context.Context, token *kiroauth.KiroTokenData) ([]
 		if err != nil {
 			return nil, err
 		}
-		resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+		resp, err := credentialHTTPClient(token.ProxyURL, credentialRequestTimeout).Do(req)
 		if err != nil {
 			return nil, pluginStatusError{status: http.StatusBadGateway, message: "list Kiro models: " + err.Error()}
 		}
@@ -1642,7 +1648,7 @@ func reconcileProfile(ctx context.Context, token *kiroauth.KiroTokenData) error 
 		return errors.New("no Kiro region is available to search for a profile")
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := credentialHTTPClient(token.ProxyURL, credentialRequestTimeout)
 	searched := make([]string, 0, len(regions))
 	var firstErr error
 	for _, region := range regions {
@@ -1723,7 +1729,7 @@ func reconcileIdentityBestEffort(ctx context.Context, token *kiroauth.KiroTokenD
 	if token == nil || strings.TrimSpace(token.AccessToken) == "" {
 		return
 	}
-	if usage, err := requestUsageLimits(ctx, usageHTTPClient(), token); err == nil {
+	if usage, err := requestUsageLimits(ctx, usageHTTPClient(token.ProxyURL), token); err == nil {
 		if email := strings.TrimSpace(usage.UserInfo.Email); looksLikeEmail(email) {
 			token.Email = email
 		}
@@ -1852,7 +1858,20 @@ func buildCoreAuth(req pluginapi.ExecutorRequest) (*coreauth.Auth, error) {
 	if fileName == "" {
 		fileName = strings.TrimSpace(req.AuthID)
 	}
-	return &coreauth.Auth{ID: req.AuthID, Provider: providerName, Label: "Kiro", FileName: fileName, Storage: &kiroAuthStorage{raw: append([]byte(nil), req.StorageJSON...)}, Metadata: metadata, Attributes: attributes}, nil
+	return &coreauth.Auth{
+		ID:       req.AuthID,
+		Provider: providerName,
+		Label:    "Kiro",
+		FileName: fileName,
+		// The executor reads auth.ProxyURL before it looks at the plugin config, so
+		// rebuilding the auth without it dropped the proxy the host had resolved for
+		// this credential and sent generation straight out. The global proxy-url
+		// fills it when the credential names none; this auth is never persisted.
+		ProxyURL:   effectiveProxyURL(token.ProxyURL),
+		Storage:    &kiroAuthStorage{raw: append([]byte(nil), req.StorageJSON...)},
+		Metadata:   metadata,
+		Attributes: attributes,
+	}, nil
 }
 
 // kiroAuthStorage keeps the original credential schema while allowing CPA's

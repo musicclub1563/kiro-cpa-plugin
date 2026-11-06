@@ -159,7 +159,7 @@ func connectAPIDeviceLogin(state, method, startURL, region string) ([]byte, erro
 }
 
 func startDeviceLogin(state, method, startURL, region string) (deviceLoginResult, error) {
-	client := kiroauth.NewSSOOIDCClient(pluginConfig)
+	client := credentialOIDCClient("")
 	registration, err := client.RegisterClientWithRegion(context.Background(), region)
 	if err != nil {
 		return deviceLoginResult{}, fmt.Errorf("register Kiro OIDC client: %w", err)
@@ -232,7 +232,7 @@ func listAvailableAPIKeyModels(ctx context.Context, accessToken, region string) 
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("User-Agent", kiroauth.ClientUserAgent())
 	request.Header.Set("X-Amz-User-Agent", kiroauth.ClientAWSUserAgent("codewhisperer"))
-	response, err := (&http.Client{Timeout: 30 * time.Second}).Do(request)
+	response, err := credentialHTTPClient("", credentialRequestTimeout).Do(request)
 	if err != nil {
 		return nil, err
 	}
@@ -286,7 +286,7 @@ func importRefreshToken(ctx context.Context, values url.Values) (*kiroauth.KiroT
 		if !strings.HasPrefix(refreshToken, "aorAAAAAG") {
 			return nil, errors.New("client ID and client secret are required for AWS refresh tokens")
 		}
-		token, err := desktopTokenRefresher(ctx, refreshToken, region)
+		token, err := desktopTokenRefresher(ctx, "", refreshToken, region)
 		if err != nil {
 			return nil, err
 		}
@@ -306,7 +306,7 @@ func importRefreshToken(ctx context.Context, values url.Values) (*kiroauth.KiroT
 		}
 		return token, nil
 	}
-	token, err := kiroauth.NewSSOOIDCClient(pluginConfig).RefreshTokenWithRegion(ctx, clientID, clientSecret, refreshToken, region, startURL)
+	token, err := credentialOIDCClient("").RefreshTokenWithRegion(ctx, clientID, clientSecret, refreshToken, region, startURL)
 	if err != nil {
 		return nil, err
 	}
@@ -321,8 +321,11 @@ func importRefreshToken(ctx context.Context, values url.Values) (*kiroauth.KiroT
 	return token, nil
 }
 
-func refreshDesktopToken(ctx context.Context, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
-	return kiroauth.NewSSOOIDCClient(pluginConfig).RefreshDesktopToken(ctx, refreshToken, region)
+// refreshDesktopToken exchanges a Kiro desktop refresh token. proxyURL is the
+// stored credential's own proxy_url, empty for a token being imported; the
+// global proxy-url applies when it is empty.
+func refreshDesktopToken(ctx context.Context, proxyURL, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
+	return credentialOIDCClient(proxyURL).RefreshDesktopToken(ctx, refreshToken, region)
 }
 
 type externalIDPJSON struct {

@@ -189,7 +189,7 @@ func TestRefreshExternalIDPSendsConfidentialClientSecret(t *testing.T) {
 // credential was stored with must come through untouched.
 func TestRefreshSocialCredentialUsesKiroAuthServiceAndKeepsStoredFields(t *testing.T) {
 	originalRefresher := desktopTokenRefresher
-	desktopTokenRefresher = func(_ context.Context, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
+	desktopTokenRefresher = func(_ context.Context, _, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
 		if refreshToken != "social-refresh" || region != "eu-west-1" {
 			t.Fatalf("desktop refresh input = %q/%q", refreshToken, region)
 		}
@@ -221,7 +221,7 @@ func TestRefreshSocialCredentialUsesKiroAuthServiceAndKeepsStoredFields(t *testi
 
 func TestRefreshImportedDesktopCredentialUsesKiroAuthService(t *testing.T) {
 	originalRefresher := desktopTokenRefresher
-	desktopTokenRefresher = func(_ context.Context, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
+	desktopTokenRefresher = func(_ context.Context, _, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
 		if refreshToken != "aorAAAAAG-imported" || region != "us-east-1" {
 			t.Fatalf("desktop refresh input = %q/%q", refreshToken, region)
 		}
@@ -325,7 +325,7 @@ func TestCollectUsageAccountsIsolatesAccountsAndFailures(t *testing.T) {
 			return errorEnvelope("unexpected", method), nil
 		}
 	}
-	usageHTTPClient = func() httpDoer {
+	usageHTTPClient = func(string) httpDoer {
 		return httpDoerFunc(func(request *http.Request) (*http.Response, error) {
 			if request.URL.Query().Get("profileArn") == "profile-two" {
 				return &http.Response{StatusCode: http.StatusTooManyRequests, Body: io.NopCloser(strings.NewReader(`{"message":"limited"}`)), Header: make(http.Header)}, nil
@@ -392,7 +392,7 @@ func TestCollectUsageAccountsDeduplicatesCredentialIdentity(t *testing.T) {
 	}
 	var requestMu sync.Mutex
 	requestCount := 0
-	usageHTTPClient = func() httpDoer {
+	usageHTTPClient = func(string) httpDoer {
 		return httpDoerFunc(func(request *http.Request) (*http.Response, error) {
 			requestMu.Lock()
 			requestCount++
@@ -443,7 +443,7 @@ func TestUsageLeavesAnExpiredTokenToCPA(t *testing.T) {
 		}
 		return okEnvelope(pluginapi.HostAuthGetResponse{AuthIndex: "a", Name: "a.json", JSON: stored})
 	}
-	usageHTTPClient = func() httpDoer {
+	usageHTTPClient = func(string) httpDoer {
 		return httpDoerFunc(func(*http.Request) (*http.Response, error) {
 			t.Fatal("usage was requested with an expired token")
 			return nil, nil
@@ -480,7 +480,7 @@ func TestConcurrentUsageReadsShareOneRequest(t *testing.T) {
 		}
 		return okEnvelope(pluginapi.HostAuthGetResponse{AuthIndex: "shared", Name: "shared.json", JSON: stored})
 	}
-	usageHTTPClient = func() httpDoer {
+	usageHTTPClient = func(string) httpDoer {
 		return httpDoerFunc(func(request *http.Request) (*http.Response, error) {
 			mu.Lock()
 			requests++
@@ -514,7 +514,7 @@ func resetUsageState() {
 
 func TestDesktopRefreshPreservesHostOwnedFields(t *testing.T) {
 	originalRefresher := desktopTokenRefresher
-	desktopTokenRefresher = func(_ context.Context, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
+	desktopTokenRefresher = func(_ context.Context, _, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
 		// The Kiro auth service answers with token material only.
 		return &kiroauth.KiroTokenData{
 			AccessToken:  "rotated-access",
@@ -587,6 +587,52 @@ func TestCarryHostOwnedFieldsRestoresARebuiltCredential(t *testing.T) {
 	}
 }
 
+// A proxy_url an operator writes into the credential is a typed field now, so it
+// no longer rides in Extra. decodeKiroCredential takes it out of the unknown-key
+// map and no transport branch returns it, so without a carry the first refresh
+// rebuilds the credential without the operator's proxy and handleRefreshAuth
+// writes that back, erasing it from the file.
+func TestCarryHostOwnedFieldsKeepsAnOperatorSetProxyURL(t *testing.T) {
+	stored, err := decodeToken([]byte(`{"type":"kiro","authMethod":"idc","accessToken":"stored-access","proxy_url":"http://proxy.example:3128"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ProxyURL != "http://proxy.example:3128" {
+		t.Fatalf("proxy_url was not decoded as a field: %q", stored.ProxyURL)
+	}
+	if _, alsoInExtra := stored.Extra["proxy_url"]; alsoInExtra {
+		t.Fatal("a typed proxy_url must not also ride in Extra")
+	}
+
+	// This is the shape a refresh returns: token material only.
+	refreshed := &kiroauth.KiroTokenData{AccessToken: "new", RefreshToken: "new-refresh", AuthMethod: "idc"}
+	carryHostOwnedFields(stored, refreshed)
+	if refreshed.ProxyURL != "http://proxy.example:3128" {
+		t.Fatalf("carry dropped the operator's proxy: %q", refreshed.ProxyURL)
+	}
+
+	// What handleRefreshAuth publishes is AuthData.StorageJSON, so that is where
+	// the erasure showed up.
+	data := authData(refreshed, "kiro-idc-proxy.json")
+	var persisted map[string]any
+	if err := json.Unmarshal(data.StorageJSON, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted["proxy_url"] != "http://proxy.example:3128" {
+		t.Fatalf("refresh erased the operator's proxy from the credential: %#v", persisted)
+	}
+	if data.ProxyURL != "http://proxy.example:3128" {
+		t.Fatalf("AuthData.ProxyURL = %q, want the credential's proxy", data.ProxyURL)
+	}
+
+	// A proxy the refresh itself resolved wins over the stored one.
+	rotated := &kiroauth.KiroTokenData{AccessToken: "newer", ProxyURL: "http://rotated.example:8080"}
+	carryHostOwnedFields(stored, rotated)
+	if rotated.ProxyURL != "http://rotated.example:8080" {
+		t.Fatalf("carry overwrote a value the refresh returned: %q", rotated.ProxyURL)
+	}
+}
+
 // An OIDC refresh returns token material only, so the rebuilt credential has
 // none of the fields AWS reported earlier. The display label is derived from
 // those fields, and losing them on every refresh turned 35 distinct Builder ID
@@ -656,7 +702,7 @@ func TestRefreshKeepsHostRuntimeStateForAuthData(t *testing.T) {
 	// rebuild the persisted CPA fields. A transport branch that returns a fresh
 	// struct must therefore not drop the runtime host state.
 	originalRefresher := desktopTokenRefresher
-	desktopTokenRefresher = func(_ context.Context, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
+	desktopTokenRefresher = func(_ context.Context, _, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
 		return &kiroauth.KiroTokenData{
 			AccessToken:  "rotated-access",
 			RefreshToken: refreshToken,
@@ -1081,7 +1127,7 @@ func TestUsageReconcileDoesNotRevertConcurrentRefresh(t *testing.T) {
 		}
 		return errorEnvelope("unexpected", method), nil
 	}
-	usageHTTPClient = func() httpDoer {
+	usageHTTPClient = func(string) httpDoer {
 		return httpDoerFunc(func(*http.Request) (*http.Response, error) {
 			body := `{"userInfo":{"userId":"d-1.user"},"subscriptionInfo":{"subscriptionTitle":"KIRO PRO"},"usageBreakdownList":[]}`
 			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
@@ -1246,7 +1292,7 @@ func TestReconcileIdentityBestEffortNamesAFreshCredential(t *testing.T) {
 		usageHTTPClient = previousClient
 		usageProfileLister = previousLister
 	})
-	usageHTTPClient = func() httpDoer {
+	usageHTTPClient = func(string) httpDoer {
 		return httpDoerFunc(func(request *http.Request) (*http.Response, error) {
 			body := `{"userInfo":{"email":null,"userId":"d-90667c527c.9f3a1b2c-4d5e-6f70-8192-a3b4c5d6e7f8"},"subscriptionInfo":{"subscriptionTitle":"KIRO POWER"},"usageBreakdownList":[{"displayNamePlural":"Credits","usageLimitWithPrecision":50}]}`
 			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
@@ -1436,7 +1482,7 @@ func TestRefreshPublishesUsageIdentityWithoutReplacingTokens(t *testing.T) {
 		t.Fatalf("usage called the host: %s", method)
 		return nil, nil
 	}
-	usageHTTPClient = func() httpDoer {
+	usageHTTPClient = func(string) httpDoer {
 		return httpDoerFunc(func(*http.Request) (*http.Response, error) {
 			return catalogResponse(http.StatusOK, `{"userInfo":{"userId":"d-1.abcdef12"},"subscriptionInfo":{"subscriptionTitle":"KIRO FREE"},"usageBreakdownList":[]}`), nil
 		})
@@ -1811,7 +1857,7 @@ func TestUsagePageRendersEveryCreditPoolAsItsOwnRow(t *testing.T) {
 	if rows := strings.Count(html, `<tr class="row"`); rows != 4 {
 		t.Fatalf("want one row per credit pool, got %d", rows)
 	}
-	if !strings.Contains(html, `rowspan="4"`) || strings.Count(html, "first@example.com") != 1 {
+	if !strings.Contains(html, `rowspan="4"`) || strings.Count(html, `<span class="label">first@example.com</span>`) != 1 {
 		t.Fatalf("the account must be named once, spanning its pools: %s", html)
 	}
 	for _, name := range []string{">Credits<", ">Free trial<", ">Bonus credits<", ">Overage credits<"} {
@@ -1898,12 +1944,10 @@ func TestUsagePageHighlightsTheWholeAccountNotOneRow(t *testing.T) {
 	if strings.Contains(usageShellCSS, "\ntr.row:hover>td{") {
 		t.Fatal("the per-row hover is back")
 	}
-	// The stripe must be declared before the highlight, or an even group would
-	// keep its zebra colour while hovered.
-	zebra := strings.Index(usageShellCSS, "tbody.account:nth-of-type(even)>tr.row>td{background:var(--zebra)}")
-	hover := strings.Index(usageShellCSS, "tbody.account:hover>tr.row>td")
-	if zebra < 0 || hover < 0 || zebra > hover {
-		t.Fatalf("the zebra stripe must be declared before the highlight (zebra=%d hover=%d)", zebra, hover)
+	// No zebra stripe: the toolbar hides groups, and :nth-of-type still counts
+	// a hidden group, so a stripe would alternate wrongly under every filter.
+	if strings.Contains(usageShellCSS, "nth-of-type") {
+		t.Fatal("a positional stripe is back")
 	}
 	// Both rows carry the same target, so a pointer or a keyboard on either one
 	// reports the same expanded state.

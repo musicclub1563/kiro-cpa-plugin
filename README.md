@@ -14,13 +14,13 @@ The plugin:
 - supports streaming, tool calls, token refresh, multiple accounts, and failover;
 - forwards client-executed function tools, bounds their descriptions to Kiro's upstream limit, and omits server-side tools that Kiro cannot execute;
 - preserves system and developer instructions exactly once as user text, because the upstream `systemPrompt` field is feature-gated;
-- provides a read-only `Kiro Usage` page for subscription usage, with per-account reload.
+- provides a `Kiro Usage` page for subscription usage, with per-account reload and an Add account dialog.
 
 `Kiro` is the name shown in the CLIProxyAPI interface. The provider ID stays `kiro`; the plugin ID, library filename, and `plugins.configs` key are `kiro-ha` (see [Build](#build)).
 
 ## Requirements
 
-- CLIProxyAPI 7.2.151 or later (built against plugin SDK v7.2.151, RPC schema 5; runs in production on 8.0.29)
+- CLIProxyAPI 7.2.151 or later (built against plugin SDK v7.2.151, RPC schema 5; runs in production on 8.0.42)
 - Windows amd64, Linux amd64, Linux arm64, macOS amd64, or macOS arm64
 - Go 1.26
 - A C compiler available to CGO
@@ -45,23 +45,32 @@ The library is named `kiro-ha` because CLIProxyAPI derives the plugin ID from th
 
 ## Install
 
-Stop CLIProxyAPI before replacing the plugin. Back up the existing binary and configuration, then copy `kiro-ha.dll` on Windows or `kiro-ha.so` on Linux to the configured plugin directory. When upgrading from a build named `kiro.so`, move the old file out of the plugin directory first: two libraries registering the same provider are both loaded and the later one silently wins.
+CLIProxyAPI looks for plugins in `<plugins.dir>/<os>/<arch>` (for example `plugins/linux/amd64`), then in `<plugins.dir>` itself, and takes the plugin ID from the file name.
 
-```yaml
-plugins:
-  enabled: true
-  dir: plugins
-  configs:
-    kiro-ha:
-      enabled: true
-      priority: 1
-```
+1. Stop CLIProxyAPI. CPA does not notice a file replaced under the same name while it runs, so a new build takes effect only after a restart.
+2. Back up the existing binary and `config.yaml`.
+3. Check the downloaded archive against the release's `checksums.txt` (`sha256sum -c --ignore-missing checksums.txt`), then copy `kiro-ha.so` on Linux, `kiro-ha.dll` on Windows or `kiro-ha.dylib` on macOS into the plugin directory.
+4. Enable the plugin in `config.yaml`:
 
-Restart CLIProxyAPI. Every sign-in method is stored as a standard CPA Authentication File; API keys are deliberately not stored in `config.yaml`.
+   ```yaml
+   plugins:
+     enabled: true
+     dir: plugins
+     configs:
+       kiro-ha:
+         enabled: true
+         priority: 1
+   ```
+
+5. Start CLIProxyAPI. The log shows `plugin registered plugin_id=kiro-ha plugin_name=Kiro version=<version>`.
+
+When upgrading from a build named `kiro.so`, move the old file out of the plugin directory first: two libraries registering the same provider are both loaded and the later one silently wins. To roll back, put the backed-up binary back under the same name and restart CLIProxyAPI.
+
+Every sign-in method is stored as a standard CPA Authentication File; API keys are deliberately not stored in `config.yaml`.
 
 ### Sign in
 
-Open the OAuth page of the Management Center, press `Start Kiro Login`, then `Open Link`. The link opens the plugin's sign-in page (`/v0/resource/plugins/kiro-ha/login`) in a new tab. Choose a method there; the Kiro card on the OAuth page finishes on its own. Nothing needs to be pasted into the card's Callback URL field.
+There are two ways in. The quickest is `Add account` on the [Kiro Usage](#kiro-usage) page, which signs in without leaving the page. The other is the OAuth page of the Management Center: press `Start Kiro Login`, then `Open Link`. The link opens the plugin's sign-in page (`/v0/resource/plugins/kiro-ha/login`) in a new tab. Choose a method there; the Kiro card on the OAuth page finishes on its own. Nothing needs to be pasted into the card's Callback URL field.
 
 The page submits the method to the authenticated `POST /v0/management/plugins/kiro/connect` route, so API keys, refresh tokens and imported JSON only travel through CPA's Management API. The sign-in page is a static shell like the Usage page: it reads the key the Management Center keeps when it signs in with “Remember password” ticked, or asks for it and holds it in memory only. The sign-in state that `StartLogin` issues travels in the URL fragment, which the browser never sends to the server.
 
@@ -91,6 +100,10 @@ Give the scheme and host only. A value with a path, query, fragment or user name
 
 The page opens outside EasyCLIProxyAPI, so it asks for the management key; EasyCLIProxyAPI shows the key in its settings under 管理密钥. EasyCLIProxyAPI's quota view covers only its built-in providers and shows no Kiro usage; open the [Kiro Usage](#kiro-usage) page for that.
 
+### Proxy
+
+Every request the plugin makes goes through a proxy chosen in CPA's own order: `proxy_url` in the credential file, then the global `proxy-url` in `config.yaml`, then `HTTPS_PROXY`/`HTTP_PROXY` from the environment of the CPA process. This covers generation, quota and model reads, profile discovery, token refresh and sign-in. The global setting is applied as each request is built and is never written into a credential, so changing or removing it takes effect for every Kiro account once CPA reloads its configuration and next refreshes or reloads a credential.
+
 The plugin stores credentials through the CLIProxyAPI authentication mechanism. Do not put passwords, management keys, access tokens, refresh tokens, or client secrets in the configuration or repository.
 
 CPA owns credential selection, failover and the 429 backoff ladder; the plugin returns status-aware errors (429/402/403/401), also for an error in the middle of a stream, and forwards an upstream `Retry-After` when Kiro sends one; CPA 8.0.42 and later cool a 429 for exactly that long. The plugin keeps only the protection CPA cannot provide: it paces requests per credential (`min_token_interval`/`max_token_interval`, default 1–2s with jitter), remembers a 402 monthly limit until the next UTC day, and takes a credential Kiro reports as suspended out of rotation for `suspend_cooldown` (default 1h). While a credential is parked it is refused with 402 (monthly limit) or 403 (suspended) rather than 429: CPA before 8.0.42 cannot read the plugin's retry-after, and CPA cools 402 and 403 for 30 minutes on every version, so they make it fail over instead of retrying the credential within seconds. These settings, like `login_base_url`, live under `plugins.configs.kiro-ha`; a credential with `disable_cooling: true` opts out of all of them.
@@ -101,6 +114,8 @@ For Anthropic Messages, the top-level `system` text is prepended to the first us
 
 For OpenAI Chat Completions, leading `system` and `developer` messages are prepended to the first user turn. Later `system` and `developer` messages stay at their original position as user text and merge with adjacent user turns.
 
+A history whose oldest turn is the assistant's, as clients that trim a long conversation send, is accepted in every format. Kiro rejects such a history, so the plugin opens it with a user turn holding the instructions, or a single `.` when the request has none.
+
 Image content is validated in every OpenAI Chat message. An unsupported remote image URL or malformed image data URL in a later turn now returns HTTP 400. Previously, validation stopped at the first user message and the translator could silently drop a later image.
 
 Reasoning controls are advertised only when the authenticated account's Kiro model schema declares an `effort` enum. Claude models currently use `additionalModelRequestFields.output_config.effort`; GPT models use `additionalModelRequestFields.reasoning.effort`. The plugin forwards the selected level through that declared path for OpenAI Responses, Chat Completions, and Anthropic Messages.
@@ -109,7 +124,9 @@ The Management API route `GET /v0/management/plugins/kiro/capabilities` (managem
 
 ## Kiro Usage
 
-Open `Kiro Usage` from the plugin menu in the Management Center. The page shows one row group per connected Kiro account with the plan, credit pools, balance, renewal date, and overage information returned by Kiro, plus fleet totals.
+Open `Kiro Usage` from the plugin menu in the Management Center. The page shows one row group per connected Kiro account with the plan, credit pools, balance, renewal date, and overage information returned by Kiro, plus fleet totals. Accounts can be filtered by state, searched by file, note, email or plan, and sorted by share used, remaining credit or reset date.
+
+`Add account`, and `Sign in again` on an account Kiro rejected, open the sign-in form in a dialog on the page. The dialog opens a sign-in session through CPA (`GET /v8/management/oauth/auth-url?provider=kiro`), submits the method to the plugin's `connect` route, and polls `GET /v8/management/oauth/status` until CPA has saved the credential, then reloads the list. Closing the dialog cancels the session. These are the routes the Management Center's own OAuth card uses, so the account is stored exactly as it would be from there.
 
 CLIProxyAPI serves plugin resource routes without the management key, so the page is split accordingly:
 
@@ -117,12 +134,13 @@ CLIProxyAPI serves plugin resource routes without the management key, so the pag
 | --- | --- | --- |
 | `GET /v0/resource/plugins/kiro-ha/usage` | none | Static shell: layout and one script, identical bytes on every request, no account data. |
 | `GET /v0/management/plugins/kiro/usage/view?lang=&refresh=` | management key | The account table as an HTML fragment. `refresh` names one credential file or `all`. |
+| `POST /v0/management/plugins/kiro/connect` | management key | The Add account dialog's sign-in, shared with the sign-in page. |
 
-The Usage and sign-in pages are available in English, Vietnamese and Simplified Chinese, following the Management Center's language. The sign-in page is drawn like the Management Center's own OAuth dialog, in the panel's light, white and dark themes.
+The Usage and sign-in pages are available in English, Vietnamese and Simplified Chinese, following the Management Center's language. Both are drawn in the Management Center's style and its light, white and dark themes; the sign-in page and the Add account dialog are its OAuth dialog.
 
 The shell reads the key the Management Center keeps when it signs in with “Remember password” ticked; otherwise it asks for the key and holds it in memory only. Its Content-Security-Policy admits only its own script by hash and allows network requests to the same origin only, so the injected fragment cannot run code. Results remain in memory for 60 seconds, and a manual reload is limited to one upstream call per account every 10 seconds.
 
-The page is read-only: it never writes quota data or credential settings. To disable or enable a credential, use the Auth Files page of the Management Center. If Kiro changes or rejects its private usage endpoint, the affected account displays an error instead of an estimated value.
+Apart from adding an account, the page is read-only: it never writes quota data or credential settings. To disable or enable a credential, use the Auth Files page of the Management Center. If Kiro changes or rejects its private usage endpoint, the affected account displays an error instead of an estimated value.
 
 ## Architecture
 

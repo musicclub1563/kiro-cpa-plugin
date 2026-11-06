@@ -28,7 +28,7 @@ const (
 // flow, so stubbing them keeps the tests independent of any real Kiro account.
 func stubSocialValidation(
 	t *testing.T,
-	refresh func(context.Context, string, string) (*kiroauth.KiroTokenData, error),
+	refresh func(context.Context, string, string, string) (*kiroauth.KiroTokenData, error),
 	catalog func(context.Context, *kiroauth.KiroTokenData) ([]controlPlaneModel, error),
 ) {
 	t.Helper()
@@ -213,7 +213,7 @@ func TestImportSocialJSONRefreshesAndValidatesBeforeReturning(t *testing.T) {
 	var refreshedWith, region string
 	var catalogToken *kiroauth.KiroTokenData
 	stubSocialValidation(t,
-		func(_ context.Context, refreshToken, requestedRegion string) (*kiroauth.KiroTokenData, error) {
+		func(_ context.Context, _ string, refreshToken, requestedRegion string) (*kiroauth.KiroTokenData, error) {
 			refreshedWith, region = refreshToken, requestedRegion
 			return rotatedSocialToken("rotated-refresh"), nil
 		},
@@ -247,7 +247,7 @@ func TestImportSocialJSONRefreshesAndValidatesBeforeReturning(t *testing.T) {
 
 func TestImportSocialJSONRejectsRefreshFailure(t *testing.T) {
 	stubSocialValidation(t,
-		func(context.Context, string, string) (*kiroauth.KiroTokenData, error) {
+		func(context.Context, string, string, string) (*kiroauth.KiroTokenData, error) {
 			return nil, errors.New("Kiro desktop refresh returned HTTP 401")
 		},
 		func(context.Context, *kiroauth.KiroTokenData) ([]controlPlaneModel, error) {
@@ -268,7 +268,7 @@ func TestImportSocialJSONRejectsRefreshFailure(t *testing.T) {
 // unrefreshed export proves nothing about the refresh token that gets stored.
 func TestImportSocialJSONRejectsRefreshFailureDespiteFreshAccessToken(t *testing.T) {
 	stubSocialValidation(t,
-		func(context.Context, string, string) (*kiroauth.KiroTokenData, error) {
+		func(context.Context, string, string, string) (*kiroauth.KiroTokenData, error) {
 			return nil, errors.New("Kiro desktop refresh returned HTTP 403")
 		},
 		func(context.Context, *kiroauth.KiroTokenData) ([]controlPlaneModel, error) {
@@ -295,7 +295,7 @@ func TestImportSocialJSONRejectsModelDiscoveryFailure(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			stubSocialValidation(t,
-				func(context.Context, string, string) (*kiroauth.KiroTokenData, error) {
+				func(context.Context, string, string, string) (*kiroauth.KiroTokenData, error) {
 					return rotatedSocialToken("rotated-refresh"), nil
 				},
 				test.catalog)
@@ -319,7 +319,7 @@ func TestImportSocialJSONDoesNotJudgeTokenPrefix(t *testing.T) {
 			payload := `{"authMethod":"social","provider":"Github","accessToken":"` + access + `","refreshToken":"aorAAAAAG-refresh"}`
 			refreshed := false
 			stubSocialValidation(t,
-				func(_ context.Context, refreshToken, _ string) (*kiroauth.KiroTokenData, error) {
+				func(_ context.Context, _, refreshToken, _ string) (*kiroauth.KiroTokenData, error) {
 					refreshed = true
 					if refreshToken != "aorAAAAAG-refresh" {
 						t.Fatalf("refresh token = %q", refreshToken)
@@ -357,7 +357,7 @@ func TestConnectAPISocialJSONImportsVerifiedCredential(t *testing.T) {
 	})
 
 	stubSocialValidation(t,
-		func(context.Context, string, string) (*kiroauth.KiroTokenData, error) {
+		func(context.Context, string, string, string) (*kiroauth.KiroTokenData, error) {
 			return rotatedSocialToken("rotated-refresh"), nil
 		},
 		oneModel)
@@ -365,7 +365,7 @@ func TestConnectAPISocialJSONImportsVerifiedCredential(t *testing.T) {
 	// this test asserts, so the HTTP client fails fast instead of reaching out.
 	previousClient := usageHTTPClient
 	t.Cleanup(func() { usageHTTPClient = previousClient })
-	usageHTTPClient = func() httpDoer {
+	usageHTTPClient = func(string) httpDoer {
 		return httpDoerFunc(func(*http.Request) (*http.Response, error) {
 			return nil, errors.New("no network in tests")
 		})

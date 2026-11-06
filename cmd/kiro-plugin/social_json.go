@@ -393,7 +393,9 @@ func importSocialJSON(ctx context.Context, raw []byte) (*kiroauth.KiroTokenData,
 	if err != nil {
 		return nil, err
 	}
-	rotated, err := desktopTokenRefresher(ctx, token.RefreshToken, token.Region)
+	// The imported document is not stored yet, so it carries no proxy of its
+	// own; the first attempt runs without one, like a freshly added account.
+	rotated, err := desktopTokenRefresher(ctx, "", token.RefreshToken, token.Region)
 	if err != nil {
 		if credentialNeedsRefresh(token, time.Now().UTC()) {
 			return nil, fmt.Errorf("Kiro social credential refresh failed: the exported access token had expired and the refresh token was rejected: %w", err)

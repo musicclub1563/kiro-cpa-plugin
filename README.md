@@ -32,7 +32,7 @@ The plugin:
 go test ./...
 go vet ./...
 CGO_ENABLED=1 go build -trimpath -buildmode=c-shared \
-  -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=2.32.0 -X main.pluginVersion=<version>" \
+  -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=3.1.0 -X main.pluginVersion=<version>" \
   -o package/kiro-ha.so ./cmd/kiro-plugin
 sha256sum package/kiro-ha.so > package/kiro-ha.so.sha256
 ```
@@ -124,7 +124,7 @@ The Management API route `GET /v0/management/plugins/kiro/capabilities` (managem
 
 ## Kiro Usage
 
-Open `Kiro Usage` from the plugin menu in the Management Center. The page shows one row group per connected Kiro account with the plan, credit pools, balance, renewal date, and overage information returned by Kiro, plus fleet totals. Accounts can be filtered by state, searched by file, note, email or plan, and sorted by share used, remaining credit or reset date.
+Open `Kiro Usage` from the plugin menu in the Management Center. The page shows one row group per connected Kiro account with the plan, credit pools, balance, renewal date, and overage information returned by Kiro, plus fleet totals. Accounts can be filtered by state, searched by file, note, email or plan, and sorted by share used, remaining credit or reset date. An account CPA is cooling down after a 429 is still read and shown as cooling down with CPA's reason; signing in again does not end a cooldown, so it is not offered there.
 
 `Add account`, and `Sign in again` on an account Kiro rejected, open the sign-in form in a dialog on the page. The dialog opens a sign-in session through CPA (`GET /v8/management/oauth/auth-url?provider=kiro`), submits the method to the plugin's `connect` route, and polls `GET /v8/management/oauth/status` until CPA has saved the credential, then reloads the list. Closing the dialog cancels the session. These are the routes the Management Center's own OAuth card uses, so the account is stored exactly as it would be from there.
 
